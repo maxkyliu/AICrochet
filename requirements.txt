@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pillow
+google-genai
+anthropic
+pydantic
+python-multipart
+typing_extensions
+requests
+beautifulsoup4
+scikit-learn
+joblib
+pytest
+python-dotenv
+trimesh
+scipy

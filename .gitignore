@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data — large files, generated
+data/aicrochet.db
+data/raw/
+data/models/*.joblib
+data/models/*.joblib.bak
+data/models/*.json
+
+# Pytest
+.pytest_cache/
+
+# Generated 3D preview output (ephemeral)
+backend/output/
+
+# OS
+.DS_Store
+
+# External GPL tool builds (cloned + compiled by scripts/build_external_tools.sh)
+.external_tools/

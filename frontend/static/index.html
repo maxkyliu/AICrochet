@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AICrochet - Image to Pattern</title>
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+    </script>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; background: #f4f4f9; }
+        h1 { color: #5a5a8a; border-bottom: 2px solid #ddd; padding-bottom: 0.5rem; }
+        .card { background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); margin-bottom: 1.5rem; }
+        button.primary { background: #6c63ff; color: white; border: none; padding: 0.8rem 2rem; border-radius: 5px; cursor: pointer; font-size: 1rem; }
+        button.primary:hover { background: #5a52d4; }
+        button.secondary { background: #f0f0f8; color: #5a5a8a; border: 1px solid #ccc; padding: 0.4rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+        button.secondary:hover { background: #e0e0f0; }
+        button.submit-btn { background: #28a745; color: white; border: none; padding: 0.5rem 1.2rem; border-radius: 4px; cursor: pointer; margin-top: 0.5rem; }
+        details.gauge-section { margin-bottom: 1rem; }
+        details.gauge-section summary { cursor: pointer; color: #6c63ff; font-weight: bold; user-select: none; }
+        .gauge-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.8rem; }
+        .gauge-grid label { font-size: 0.9rem; color: #555; }
+        .gauge-grid input, .gauge-grid select { width: 100%; padding: 0.4rem; border: 1px solid #ccc; border-radius: 4px; }
+        .upload-section { text-align: center; }
+        .upload-section input { margin-bottom: 1rem; }
+        .part-card { background: white; border-radius: 8px; margin-bottom: 1.2rem; box-shadow: 0 1px 5px rgba(0,0,0,0.06); overflow: hidden; }
+        .part-card-header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.5rem 0.5rem; }
+        .part-name { font-weight: bold; color: #6c63ff; font-size: 1.15rem; }
+        .part-body { display: grid; grid-template-columns: 220px 1fr; gap: 0; }
+        .part-preview { background: #1a1a2e; display: flex; align-items: center; justify-content: center; min-height: 200px; }
+        .part-preview canvas { display: block; }
+        .part-preview .no-webgl { color: #aaa; font-size: 0.8rem; text-align: center; padding: 1rem; }
+        .part-instructions { padding: 1rem 1.5rem; }
+        pre { background: #f8f8f8; padding: 0.8rem; border-radius: 5px; overflow-x: auto; font-size: 0.85rem; margin: 0; }
+        .adjust-section { padding: 0.5rem 1.5rem 1rem; border-top: 1px solid #eee; }
+        .adjust-panel { margin-top: 0.8rem; }
+        .slider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.5rem; margin-bottom: 0.8rem; }
+        .slider-row label { font-size: 0.8rem; color: #555; display: block; }
+        .slider-row input[type=range] { width: 100%; }
+        .slider-row .val { font-size: 0.75rem; color: #6c63ff; float: right; }
+        .correction-status { font-size: 0.85rem; margin-left: 1rem; }
+        .correction-status.ok { color: #28a745; }
+        .correction-status.err { color: #dc3545; }
+        #combined-preview { background: #1a1a2e; border-radius: 8px; margin-bottom: 1.5rem; display: none; }
+        #combined-preview canvas { display: block; border-radius: 8px; }
+        #status-msg { color: #888; font-style: italic; }
+        #preview-status { font-size: 0.85rem; color: #9c7fe0; margin-bottom: 0.5rem; display: none; }
+        #measure-status { font-size: 0.85rem; color: #28a745; margin-bottom: 0.5rem; display: none; }
+    </style>
+</head>
+<body>
+    <h1>AICrochet</h1>
+    <p>Upload a photo of a doll to generate crochet instructions and a 3D preview.</p>
+
+    <div class="card">
+        <!-- Gauge Settings (collapsible) -->
+        <details class="gauge-section">
+            <summary>Gauge Settings (optional)</summary>
+            <div class="gauge-grid">
+                <div>
+                    <label>Yarn weight preset</label>
+                    <select id="gaugePreset" onchange="applyPreset()">
+                        <option value="">— choose preset —</option>
+                        <option value="28,36">Fingering (28 st / 36 rows per 10cm)</option>
+                        <option value="24,32">Sport (24 st / 32 rows per 10cm)</option>
+                        <option value="22,28">DK (22 st / 28 rows per 10cm)</option>
+                        <option value="20,24">Worsted (20 st / 24 rows per 10cm)</option>
+                        <option value="14,18">Bulky (14 st / 18 rows per 10cm)</option>
+                    </select>
+                </div>
+                <div></div>
+                <div>
+                    <label>Stitches per 10cm</label>
+                    <input type="number" id="stitchesPer10" min="1" max="60" step="1" placeholder="e.g. 20"
+                           oninput="document.getElementById('gaugePreset').value=''">
+                </div>
+                <div>
+                    <label>Rows per 10cm</label>
+                    <input type="number" id="rowsPer10" min="1" max="80" step="1" placeholder="e.g. 24"
+                           oninput="document.getElementById('gaugePreset').value=''">
+                </div>
+            </div>
+        </details>
+
+        <!-- Upload -->
+        <div class="upload-section">
+            <input type="file" id="imageInput" accept="image/*"><br>
+            <button class="primary" onclick="generatePattern()">Generate Pattern</button>
+        </div>
+    </div>
+
+    <div id="status-msg"></div>
+    <div id="preview-status"></div>
+    <div id="measure-status"></div>
+    <div id="combined-preview"></div>
+    <div id="results"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Session ID for feedback attribution
+const SESSION_ID = crypto.randomUUID();
+
+// ─── Gauge helpers ───────────────────────────────────────────────────────────
+window.applyPreset = function() {
+    const val = document.getElementById('gaugePreset').value;
+    if (!val) return;
+    const [st, rows] = val.split(',').map(Number);
+    document.getElementById('stitchesPer10').value = st;
+    document.getElementById('rowsPer10').value = rows;
+};
+
+// ─── 3D helpers ──────────────────────────────────────────────────────────────
+function buildLathePoints(diameters) {
+    return diameters.map((d, i) => new THREE.Vector2(d / 2, i));
+}
+
+function createScene(canvas, diameters, autoRotate = true) {
+    let webglOk = true;
+    try {
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+        renderer.setSize(canvas.width, canvas.height);
+        renderer.setClearColor(0x1a1a2e, 1);
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, canvas.width / canvas.height, 0.1, 1000);
+
+        const points = buildLathePoints(diameters);
+        const geometry = new THREE.LatheGeometry(points, 48);
+        const material = new THREE.MeshPhongMaterial({
+            color: 0x9c7fe0,
+            emissive: 0x1a0050,
+            shininess: 60,
+            side: THREE.DoubleSide,
+            wireframe: false,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(5, 10, 7);
+        scene.add(dirLight);
+
+        // Center the mesh
+        geometry.computeBoundingBox();
+        const center = new THREE.Vector3();
+        geometry.boundingBox.getCenter(center);
+        mesh.position.sub(center);
+
+        const size = new THREE.Vector3();
+        geometry.boundingBox.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z);
+        camera.position.set(0, 0, maxDim * 2.5);
+        camera.lookAt(0, 0, 0);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        let idleTimer = null;
+        let rotating = autoRotate;
+
+        controls.addEventListener('start', () => {
+            rotating = false;
+            clearTimeout(idleTimer);
+        });
+        controls.addEventListener('end', () => {
+            idleTimer = setTimeout(() => { rotating = true; }, 2000);
+        });
+
+        let animId;
+        function animate() {
+            animId = requestAnimationFrame(animate);
+            if (rotating) mesh.rotation.y += 0.008;
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        return { renderer, scene, camera, mesh, animId };
+    } catch (e) {
+        webglOk = false;
+        canvas.parentElement.innerHTML =
+            '<div class="no-webgl">3D preview not available in this browser</div>';
+        return null;
+    }
+}
+
+// ─── Combined scene ──────────────────────────────────────────────────────────
+const POSITION_KEYWORDS = {
+    head:   [0,  1,  0],
+    body:   [0,  0,  0],
+    arm:    [1,  0.3, 0],
+    leg:    [0, -1,  0],
+    ear:    [0,  1.8, 0],
+    tail:   [0, -1.5, 0],
+    snout:  [0,  0.3, 0.8],
+    nose:   [0,  0.4, 1],
+};
+
+function inferPosition(name, index, totalParts) {
+    const lower = name.toLowerCase();
+    for (const [kw, pos] of Object.entries(POSITION_KEYWORDS)) {
+        if (lower.includes(kw)) {
+            const side = lower.includes('right') ? 1 : lower.includes('left') ? -1 : 0;
+            return [pos[0] + side * 0.6, pos[1], pos[2]];
+        }
+    }
+    // Unknown: place in a row to the right
+    return [2.5 + (index % 3) * 1.5, Math.floor(index / 3) * 1.5, 0];
+}
+
+function buildCombinedScene(partsData) {
+    const container = document.getElementById('combined-preview');
+    container.style.display = 'block';
+    container.innerHTML = '<canvas id="combined-canvas" width="860" height="320"></canvas>';
+    const canvas = document.getElementById('combined-canvas');
+
+    try {
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setSize(860, 320);
+        renderer.setClearColor(0x1a1a2e, 1);
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, 860 / 320, 0.1, 2000);
+        camera.position.set(0, 5, 35);
+        camera.lookAt(0, 0, 0);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(10, 20, 15);
+        scene.add(dirLight);
+
+        const colors = [0x9c7fe0, 0x7fb8e0, 0xe07fb8, 0x7fe0b8, 0xe0c07f, 0xb87fe0];
+
+        partsData.forEach((part, idx) => {
+            const points = buildLathePoints(part.diameters);
+            const geometry = new THREE.LatheGeometry(points, 32);
+            const material = new THREE.MeshPhongMaterial({
+                color: colors[idx % colors.length],
+                shininess: 50,
+                side: THREE.DoubleSide,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+
+            geometry.computeBoundingBox();
+            const size = new THREE.Vector3();
+            geometry.boundingBox.getSize(size);
+            const scale = 5 / Math.max(size.x, size.y, size.z, 1);
+            mesh.scale.setScalar(scale);
+
+            const [px, py, pz] = inferPosition(part.name, idx, partsData.length);
+            mesh.position.set(px * 4, py * 4, pz * 4);
+            scene.add(mesh);
+        });
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        let rotating = true;
+        let idleTimer = null;
+        controls.addEventListener('start', () => { rotating = false; clearTimeout(idleTimer); });
+        controls.addEventListener('end', () => { idleTimer = setTimeout(() => { rotating = true; }, 2000); });
+
+        const group = new THREE.Group();
+        scene.children.filter(c => c.type === 'Mesh').forEach(m => group.add(m));
+        scene.add(group);
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (rotating) group.rotation.y += 0.004;
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    } catch (e) {
+        container.innerHTML = '<div style="color:#aaa;padding:1rem;text-align:center">3D preview not available in this browser</div>';
+    }
+}
+
+// ─── GLB scene (real Hunyuan3D mesh) ─────────────────────────────────────────
+function buildGlbScene(glbUrl) {
+    const container = document.getElementById('combined-preview');
+    container.style.display = 'block';
+    container.innerHTML = '<canvas id="combined-canvas" width="860" height="320"></canvas>';
+    const canvas = document.getElementById('combined-canvas');
+
+    try {
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setSize(860, 320);
+        renderer.setClearColor(0x1a1a2e, 1);
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, 860 / 320, 0.1, 2000);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(10, 20, 15);
+        scene.add(dirLight);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        let rotating = true;
+        let idleTimer = null;
+        controls.addEventListener('start', () => { rotating = false; clearTimeout(idleTimer); });
+        controls.addEventListener('end', () => { idleTimer = setTimeout(() => { rotating = true; }, 2000); });
+
+        const loader = new GLTFLoader();
+        loader.load(glbUrl, (gltf) => {
+            const model = gltf.scene;
+            scene.add(model);
+
+            // Center and fit the model
+            const box = new THREE.Box3().setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            model.position.sub(center);
+
+            const maxDim = Math.max(size.x, size.y, size.z);
+            camera.position.set(0, maxDim * 0.3, maxDim * 2.2);
+            camera.lookAt(0, 0, 0);
+            controls.update();
+
+            function animate() {
+                requestAnimationFrame(animate);
+                if (rotating) model.rotation.y += 0.004;
+                controls.update();
+                renderer.render(scene, camera);
+            }
+            animate();
+        }, undefined, (err) => {
+            console.error('GLTFLoader error:', err);
+        });
+    } catch (e) {
+        container.innerHTML = '<div style="color:#aaa;padding:1rem;text-align:center">3D preview not available</div>';
+    }
+}
+
+// ─── Preview polling ──────────────────────────────────────────────────────────
+function startPreviewPolling(sessionId) {
+    const badge = document.getElementById('preview-status');
+    badge.textContent = '⏳ 3D preview generating…';
+    badge.style.display = 'block';
+
+    let ticks = 0;
+    const MAX_TICKS = 150;
+
+    const timer = setInterval(async () => {
+        ticks++;
+        try {
+            const resp = await fetch(`/preview/${sessionId}`);
+            if (!resp.ok) { clearInterval(timer); badge.style.display = 'none'; return; }
+            const job = await resp.json();
+
+            if (job.status === 'done') {
+                clearInterval(timer);
+                badge.style.display = 'none';
+                buildGlbScene(job.glb_url);
+            } else if (job.status === 'failed') {
+                clearInterval(timer);
+                badge.style.display = 'none';
+            } else if (ticks >= MAX_TICKS) {
+                clearInterval(timer);
+                badge.style.display = 'none';
+            }
+        } catch (_) {
+            clearInterval(timer);
+            badge.style.display = 'none';
+        }
+    }, 4000);
+}
+
+// ─── Feedback helpers ─────────────────────────────────────────────────────────
+function buildFeedbackPanel(partCard, part) {
+    const section = partCard.querySelector('.adjust-section');
+    const panel = partCard.querySelector('.adjust-panel');
+    const btn = partCard.querySelector('.adjust-btn');
+    const statusEl = partCard.querySelector('.correction-status');
+    const submitBtn = partCard.querySelector('.submit-btn');
+    const sliderGrid = partCard.querySelector('.slider-grid');
+
+    const currentDiameters = [...part.diameters];
+
+    // Build sliders
+    part.diameters.forEach((d, i) => {
+        const row = document.createElement('div');
+        row.className = 'slider-row';
+        const maxVal = Math.max(d * 2.5, 10).toFixed(1);
+        row.innerHTML = `
+            <label>Rnd ${i + 1} <span class="val" id="val-${part.name}-${i}">${d.toFixed(1)}</span></label>
+            <input type="range" min="0" max="${maxVal}" step="0.5" value="${d.toFixed(1)}"
+                   data-idx="${i}" data-part="${part.name}">
+        `;
+        row.querySelector('input').addEventListener('input', function() {
+            currentDiameters[this.dataset.idx] = parseFloat(this.value);
+            document.getElementById(`val-${part.name}-${i}`).textContent = parseFloat(this.value).toFixed(1);
+        });
+        sliderGrid.appendChild(row);
+    });
+
+    btn.addEventListener('click', () => {
+        const visible = panel.style.display !== 'none';
+        panel.style.display = visible ? 'none' : 'block';
+        btn.textContent = visible ? 'Adjust Shape' : 'Close Adjuster';
+    });
+
+    submitBtn.addEventListener('click', async () => {
+        statusEl.textContent = 'Submitting…';
+        statusEl.className = 'correction-status';
+        try {
+            const resp = await fetch('/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: SESSION_ID,
+                    part_name: part.name,
+                    primitive_type: part.primitive_type || null,
+                    original_diameters: part.diameters,
+                    corrected_diameters: [...currentDiameters],
+                }),
+            });
+            if (resp.ok) {
+                statusEl.textContent = 'Correction submitted!';
+                statusEl.className = 'correction-status ok';
+            } else {
+                const err = await resp.json();
+                statusEl.textContent = `Error: ${err.detail || resp.status}`;
+                statusEl.className = 'correction-status err';
+            }
+        } catch (e) {
+            statusEl.textContent = 'Network error submitting correction.';
+            statusEl.className = 'correction-status err';
+        }
+    });
+}
+
+// ─── Main generate function ───────────────────────────────────────────────────
+window.generatePattern = async function() {
+    const input = document.getElementById('imageInput');
+    if (!input.files[0]) return alert('Please select an image first.');
+
+    const status = document.getElementById('status-msg');
+    const results = document.getElementById('results');
+    const combined = document.getElementById('combined-preview');
+    const badge = document.getElementById('preview-status');
+
+    status.textContent = 'Analyzing photo and generating pattern…';
+    results.innerHTML = '';
+    combined.style.display = 'none';
+    badge.style.display = 'none';
+
+    const sessionId = SESSION_ID;
+    const formData = new FormData();
+    formData.append('file', input.files[0]);
+    formData.append('session_id', sessionId);
+
+    const stitches = document.getElementById('stitchesPer10').value;
+    const rows = document.getElementById('rowsPer10').value;
+    if (stitches) formData.append('gauge_stitches_per_10cm', stitches);
+    if (rows) formData.append('gauge_rows_per_10cm', rows);
+
+    try {
+        const resp = await fetch('/generate', { method: 'POST', body: formData });
+        if (!resp.ok) {
+            const err = await resp.json();
+            status.textContent = `Error: ${err.detail || resp.status}`;
+            return;
+        }
+        const data = await resp.json();
+        status.textContent = '';
+
+        // Build combined LatheGeometry scene immediately as fallback
+        buildCombinedScene(data);
+
+        // Start polling for real 3D mesh, then physics refinement
+        startPreviewPolling(sessionId);
+        startMeasurePolling(sessionId);
+
+        // Build per-part cards
+        renderParts(data);
+
+    } catch (err) {
+        status.textContent = 'Network error — is the backend running?';
+        console.error(err);
+    }
+};
+
+// ─── Per-part card rendering (reused by measurement swap) ────────────────────
+function renderParts(data) {
+    const results = document.getElementById('results');
+    results.innerHTML = '';
+    data.forEach(part => {
+        const card = document.createElement('div');
+        card.className = 'part-card';
+        card.innerHTML = `
+            <div class="part-card-header">
+                <span class="part-name">${part.name}
+                    ${part.primitive_type ? `<small style="font-weight:normal;color:#999">(${part.primitive_type})</small>` : ''}
+                </span>
+                <button class="secondary adjust-btn">Adjust Shape</button>
+            </div>
+            <div class="part-body">
+                <div class="part-preview">
+                    <canvas width="220" height="200" class="part-canvas"></canvas>
+                </div>
+                <div class="part-instructions">
+                    <pre>${part.instructions.join('\n')}</pre>
+                </div>
+            </div>
+            <div class="adjust-section">
+                <div class="adjust-panel" style="display:none">
+                    <div class="slider-grid"></div>
+                    <button class="submit-btn">Submit Correction</button>
+                    <span class="correction-status"></span>
+                </div>
+            </div>
+        `;
+        results.appendChild(card);
+        createScene(card.querySelector('.part-canvas'), part.diameters);
+        buildFeedbackPanel(card, part);
+    });
+}
+
+// ─── Measurement polling: swap in mesh-measured pattern when ready ───────────
+function startMeasurePolling(sessionId) {
+    const badge = document.getElementById('measure-status');
+    badge.textContent = '⚙ Measuring pattern from 3D model…';
+    badge.style.display = 'block';
+
+    let ticks = 0;
+    const MAX_TICKS = 150;
+    const timer = setInterval(async () => {
+        ticks++;
+        try {
+            const resp = await fetch(`/measured/${sessionId}`);
+            if (resp.status === 404) { clearInterval(timer); badge.style.display = 'none'; return; }
+            const job = await resp.json();
+            if (job.status === 'done') {
+                clearInterval(timer);
+                badge.textContent = '✓ Pattern adjusted to match the 3D model';
+                if (job.parts) renderParts(job.parts);
+                setTimeout(() => { badge.style.display = 'none'; }, 4000);
+            } else if (job.status === 'failed' || ticks >= MAX_TICKS) {
+                clearInterval(timer);
+                badge.style.display = 'none';
+            }
+        } catch (_) {
+            clearInterval(timer);
+            badge.style.display = 'none';
+        }
+    }, 4000);
+}
+</script>
+</body>
+</html>
