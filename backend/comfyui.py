@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -105,8 +106,20 @@ def stop() -> None:
 
 # ─── Job tracker ─────────────────────────────────────────────────────────────
 
+_JOB_TTL_SECONDS = 3600
+
+
+def _evict_expired() -> None:
+    cutoff = time.time() - _JOB_TTL_SECONDS
+    for sid in [s for s, j in _jobs.items() if j.get("created_at", 0) < cutoff]:
+        del _jobs[sid]
+
+
 def create_job(session_id: str) -> None:
-    _jobs[session_id] = {"status": "pending", "glb_url": None, "error": None}
+    _evict_expired()
+    _jobs[session_id] = {
+        "status": "pending", "glb_url": None, "error": None, "created_at": time.time(),
+    }
 
 
 def update_job(session_id: str, **kwargs) -> None:

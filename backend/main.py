@@ -2,8 +2,12 @@ import os
 import io
 import sys
 import json
+import time
 import uuid
 import asyncio
+import logging
+import threading
+import subprocess
 import PIL.Image
 from dotenv import load_dotenv
 
@@ -36,6 +40,7 @@ except ImportError:
 
 RETRAIN_THRESHOLD = int(os.environ.get("RETRAIN_THRESHOLD", "100"))
 
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 geo = GeometryEngine()
@@ -67,10 +72,20 @@ async def _shutdown():
 # ─── Mesh-measurement async job tracker ───────────────────────────────────────
 
 _measure_jobs: dict = {}
+_MEASURE_JOB_TTL_SECONDS = 3600
+
+
+def _measure_evict_expired() -> None:
+    cutoff = time.time() - _MEASURE_JOB_TTL_SECONDS
+    for sid in [s for s, j in _measure_jobs.items() if j.get("created_at", 0) < cutoff]:
+        del _measure_jobs[sid]
 
 
 def _measure_create(session_id: str) -> None:
-    _measure_jobs[session_id] = {"status": "pending", "parts": None, "error": None}
+    _measure_evict_expired()
+    _measure_jobs[session_id] = {
+        "status": "pending", "parts": None, "error": None, "created_at": time.time(),
+    }
 
 
 def _measure_update(session_id: str, **kwargs) -> None:
@@ -177,17 +192,37 @@ class FeedbackRequest(BaseModel):
     notes: Optional[str] = None
 
 
+# Runs in a threadpool (sync BackgroundTasks), so guard with a threading lock:
+# two feedback submissions near the threshold must not spawn concurrent trainings.
+_retrain_lock = threading.Lock()
+_retrain_process: Optional[subprocess.Popen] = None
+
+
 def _maybe_trigger_retraining():
+    global _retrain_process
     if not DB_AVAILABLE:
         return
     try:
         with get_db() as conn:
             count = get_unincorporated_count(conn)
-        if count >= RETRAIN_THRESHOLD:
-            import subprocess
-            subprocess.Popen([sys.executable, "-m", "models.train", "--all"])
-    except Exception:
-        pass
+        if count < RETRAIN_THRESHOLD:
+            return
+        with _retrain_lock:
+            if _retrain_process is not None and _retrain_process.poll() is None:
+                logger.info(
+                    "Retraining already running (PID %d) — skipping trigger",
+                    _retrain_process.pid,
+                )
+                return
+            _retrain_process = subprocess.Popen(
+                [sys.executable, "-m", "models.train", "--all"], cwd=PROJECT_ROOT
+            )
+            logger.info(
+                "Spawned retraining (PID %d) — %d unincorporated corrections",
+                _retrain_process.pid, count,
+            )
+    except Exception as exc:
+        logger.warning("Retraining trigger failed: %s", exc)
 
 
 GEMINI_PROMPT = (
@@ -266,7 +301,9 @@ async def generate_pattern(
         image.convert("RGB").save(img_io, format="JPEG")
         img_bytes = img_io.getvalue()
 
-        analysis = analyze_with_retry(img_bytes, GEMINI_PROMPT)
+        # Vision call is synchronous (network roundtrip + retries) — run it off
+        # the event loop so preview/measure polling stays responsive.
+        analysis = await asyncio.to_thread(analyze_with_retry, img_bytes, GEMINI_PROMPT)
         graph = _coerce_limb_types(analysis.get("parts", []))
 
         # Stash bboxes by part name for the mesh-measurement coordinator.
