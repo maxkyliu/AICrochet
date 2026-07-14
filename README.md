@@ -77,8 +77,9 @@ All variables and their defaults:
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GOOGLE_API_KEY` | With gemini provider | — | Gemini Vision API key |
-| `VISION_PROVIDER` | No | `gemini` | Vision backend: `gemini`, `claude`, or `ollama` |
+| `VISION_PROVIDER` | No | `gemini` | Vision backend: `gemini`, `claude`, `ollama`, or `agnes` |
 | `GEMINI_MODEL` | No | `gemini-2.0-flash` | Gemini model name |
+| `AGNES_API_KEY` | With agnes provider | — | Agnes AI key (`AGNES_BASE_URL`, `AGNES_MODEL` optional) |
 | `ANTHROPIC_API_KEY` | With claude provider | — | Claude API key (`ANTHROPIC_MODEL` optional) |
 | `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama server (`OLLAMA_MODEL` default `llava`) |
 | `COMFYUI_URL` | No | `http://127.0.0.1:8188` | ComfyUI endpoint for 3D generation |

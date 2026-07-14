@@ -4,6 +4,7 @@ Set VISION_PROVIDER in .env to switch providers:
   VISION_PROVIDER=gemini   (default) — requires GOOGLE_API_KEY
   VISION_PROVIDER=claude             — requires ANTHROPIC_API_KEY
   VISION_PROVIDER=ollama             — requires a running Ollama server with a vision model
+  VISION_PROVIDER=agnes              — requires AGNES_API_KEY (OpenAI-compatible API)
 """
 
 import base64
@@ -60,7 +61,9 @@ def analyze_image(img_bytes: bytes, prompt: str) -> dict:
         return _analyze_claude(img_bytes, prompt)
     if provider == "ollama":
         return _analyze_ollama(img_bytes, prompt)
-    raise ValueError(f"Unknown VISION_PROVIDER '{provider}'. Valid: gemini, claude, ollama")
+    if provider == "agnes":
+        return _analyze_agnes(img_bytes, prompt)
+    raise ValueError(f"Unknown VISION_PROVIDER '{provider}'. Valid: gemini, claude, ollama, agnes")
 
 
 def _analyze_gemini(img_bytes: bytes, prompt: str) -> dict:
@@ -134,6 +137,54 @@ def _analyze_claude(img_bytes: bytes, prompt: str) -> dict:
     raise RuntimeError("Claude response contained no tool_use block")
 
 
+def _strip_code_fences(text: str) -> str:
+    """Strip markdown code fences if the model wraps its JSON output."""
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    return text
+
+
+def _analyze_agnes(img_bytes: bytes, prompt: str) -> dict:
+    """OpenAI-compatible chat-completions provider (Agnes AI)."""
+    import requests
+
+    base_url = os.environ.get("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
+    api_key = os.environ.get("AGNES_API_KEY")
+    if not api_key:
+        raise RuntimeError("AGNES_API_KEY is not set")
+    model = os.environ.get("AGNES_MODEL", "agnes-2.0-flash")
+    img_b64 = base64.standard_b64encode(img_bytes).decode()
+
+    resp = requests.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text", "text": (
+                        prompt
+                        + "\n\nRespond with ONLY a valid JSON object matching this schema"
+                        " (no markdown, no explanation):\n"
+                        + json.dumps(_PARTS_SCHEMA)
+                    )},
+                ],
+            }],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 2048,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return json.loads(_strip_code_fences(text))
+
+
 def _analyze_ollama(img_bytes: bytes, prompt: str) -> dict:
     import requests
 
@@ -154,15 +205,7 @@ def _analyze_ollama(img_bytes: bytes, prompt: str) -> dict:
     )
     resp.raise_for_status()
     text = resp.json().get("response", "").strip()
-
-    # Strip markdown code fences if the model wraps its output
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-
-    return json.loads(text)
+    return json.loads(_strip_code_fences(text))
 
 
 # ─── Silent-retry wrapper for under-segmenting providers ──────────────────────
