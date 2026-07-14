@@ -1,17 +1,20 @@
 # AICrochet
 
-Upload a photo of a doll and get row-by-row crochet instructions to build it by hand. The system uses Google Gemini Vision to decompose the doll into 3D geometric parts, a geometry engine to compute cross-section diameter profiles, and a rule-based grammar to emit mathematically valid stitch instructions. A 3D preview renders in the browser. Crafter feedback feeds back into a learned geometry model that improves over time.
+Upload a photo of a doll and get row-by-row crochet instructions to build it by hand. The system uses a vision LLM (Gemini by default; Claude and Ollama supported) to decompose the doll into 3D geometric parts, a geometry engine to compute cross-section diameter profiles, and a rule-based grammar to emit mathematically valid stitch instructions. A 3D preview renders in the browser; when the optional Hunyuan3D pipeline is available, the pattern is refined with diameters measured from an actual 3D mesh of the photo. Crafter feedback feeds back into a learned geometry model that improves over time.
 
 ---
 
 ## Architecture Overview
 
 ```
-Photo → Gemini Vision → Part graph (sphere/cylinder/cone/…)
-      → GeometryEngine  → Diameter profiles (scale-aware, 8 primitives)
+Photo → Vision LLM     → Part graph (8 primitives + scale + bbox)
+      → GeometryEngine  → Diameter profiles (scale-aware)
       → CrochetGrammar  → Stitch instructions (gauge-aware)
       → Browser         → 3D LatheGeometry preview + text pattern
       → Crafter         → Correction feedback → Model retraining
+
+Async (optional, needs Node ≥ 22 + ComfyUI):
+Photo → Hunyuan3D .glb  → per-part mesh measurement → refined pattern swap
 ```
 
 Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md)
@@ -21,7 +24,15 @@ Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md)
 ## Requirements
 
 - Python 3.12+
-- A Google Gemini API key (free at [aistudio.google.com](https://aistudio.google.com))
+- A Google Gemini API key (free at [aistudio.google.com](https://aistudio.google.com)) — or set `VISION_PROVIDER` to use Claude or a local Ollama vision model instead
+
+Optional, for the true-mesh 3D preview and mesh-measured patterns:
+
+- Node.js ≥ 22
+- A local ComfyUI install at `~/ComfyUI` (venv at `~/comfyui-env`) with the Hunyuan3D workflow
+- The image-blaster `image-to-3d.mjs` pipeline script
+
+Without these, the app still works — parts render as profile-based 3D previews and patterns use the geometry engine's profiles.
 
 ---
 
@@ -55,7 +66,14 @@ All variables and their defaults:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `GOOGLE_API_KEY` | Yes | — | Gemini Vision API key |
+| `GOOGLE_API_KEY` | With gemini provider | — | Gemini Vision API key |
+| `VISION_PROVIDER` | No | `gemini` | Vision backend: `gemini`, `claude`, or `ollama` |
+| `GEMINI_MODEL` | No | `gemini-2.0-flash` | Gemini model name |
+| `ANTHROPIC_API_KEY` | With claude provider | — | Claude API key (`ANTHROPIC_MODEL` optional) |
+| `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama server (`OLLAMA_MODEL` default `llava`) |
+| `COMFYUI_URL` | No | `http://127.0.0.1:8188` | ComfyUI endpoint for 3D generation |
+| `COMFYUI_PORT` | No | `8188` | Port used when auto-launching ComfyUI |
+| `COMFYUI_3D_STEPS` | No | `20` | Hunyuan3D sampling steps |
 | `RAVELRY_USERNAME` | Phase 2 only | — | Ravelry account username |
 | `RAVELRY_API_KEY` | Phase 2 only | — | Ravelry personal API key |
 | `AICROCHET_DB` | No | `data/aicrochet.db` | Path to SQLite database |
@@ -98,7 +116,7 @@ To use a custom host/port from `.env`:
 
 2. **Upload** a photo of a doll and click **Generate Pattern**.
 
-3. **Results** — a combined 3D scene appears at the top; each part gets a rotatable 3D preview and its stitch instructions below.
+3. **Results** — a combined 3D scene appears at the top; each part gets a rotatable 3D preview and its stitch instructions below. If the ComfyUI pipeline is available, a true 3D mesh of the photo replaces the combined scene (~1–2 min), and shortly after, patterns are refreshed with diameters measured from that mesh.
 
 4. **Adjust Shape** — per-part slider panel lets you correct each round's diameter and submit the correction back to the server (feeds the learning loop).
 
@@ -112,7 +130,7 @@ To use a custom host/port from `.env`:
 .venv/bin/python -m pytest backend/tests/ -v
 ```
 
-34 tests covering all 8 primitive types, scale arithmetic, flat-round extension, and validation.
+65 tests covering all 8 primitive types, scale arithmetic, flat-round extension, grammar output (rounds, flat rows, closures), mesh measurement on synthetic geometry, vision retry logic, and job-tracker eviction.
 
 ### Smoke test (no server, no API key)
 
@@ -251,11 +269,13 @@ AICrochet/
 ├── .env.example                # template to copy
 ├── requirements.txt
 ├── backend/
-│   ├── main.py                 # FastAPI server + endpoints
+│   ├── main.py                 # FastAPI server, endpoints, async job coordination
+│   ├── vision.py               # Gemini/Claude/Ollama provider abstraction + retry
 │   ├── geometry.py             # 8-primitive scale-aware geometry engine
 │   ├── grammar.py              # gauge-aware stitch instruction generator
-│   └── tests/
-│       └── test_geometry.py    # 34 unit tests
+│   ├── comfyui.py              # ComfyUI lifecycle + Hunyuan3D image→.glb jobs
+│   ├── mesh_measure.py         # per-part diameter measurement from the .glb
+│   └── tests/                  # 65 unit tests
 ├── frontend/
 │   └── static/
 │       └── index.html          # upload UI, 3D preview, feedback sliders

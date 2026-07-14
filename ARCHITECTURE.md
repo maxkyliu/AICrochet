@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-AICrochet converts a photo of a doll into row-by-row crochet stitch instructions that a crafter can follow to manually build a matching 3D amigurumi-style doll. The system is designed to improve over time as better shape priors and learned parameters replace the current hardcoded defaults.
+AICrochet converts a photo of a doll into row-by-row crochet stitch instructions that a crafter can follow to manually build a matching 3D amigurumi-style doll. A neuro-symbolic pipeline separates vision understanding (neural) from pattern generation (symbolic), so generated patterns are always mathematically valid crochet. Two learning mechanisms improve shape fidelity over time: direct measurement of an AI-generated 3D mesh, and a crafter-feedback loop that retrains per-primitive geometry models.
 
 ---
 
@@ -11,158 +11,178 @@ AICrochet converts a photo of a doll into row-by-row crochet stitch instructions
 ```
 User Browser
      │
-     │  POST /generate (multipart image)
+     │  POST /generate (multipart image + optional gauge)
      ▼
-┌─────────────────────────────────────────────────┐
-│  FastAPI Backend  (backend/main.py)             │
-│                                                 │
-│  1. Image ingest & validation                   │
-│  2. Gemini Vision API call ──► Google Cloud     │
-│  3. Parse JSON part graph                       │
-│  4. GeometryEngine.process_dependency_graph()   │
-│  5. CrochetGrammar.compile_part()               │
-│  6. Return List[PatternResponse]                │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  FastAPI Backend  (backend/main.py)                          │
+│                                                              │
+│  Synchronous path (returns in one request):                  │
+│  1. Image ingest, persist upload for async jobs              │
+│  2. Vision analysis (vision.py) ──► Gemini / Claude / Ollama │
+│  3. Part-type coercion guards (limbs, ears)                  │
+│  4. GeometryEngine.process_dependency_graph()                │
+│  5. CrochetGrammar.compile_part()                            │
+│  6. Return List[PatternResponse]                             │
+│                                                              │
+│  Async path (spawned per session, polled by the browser):    │
+│  A. comfyui.generate_3d() ──► Hunyuan3D .glb  → GET /preview │
+│  B. mesh_measure: slice .glb per part, recompile pattern     │
+│     with measured diameters              → GET /measured     │
+└──────────────────────────────────────────────────────────────┘
      │
-     │  JSON: [{name, instructions[]}, …]
      ▼
 Frontend  (frontend/static/index.html)
-  Renders per-part instruction cards
+  Per-part instruction cards + Three.js LatheGeometry previews,
+  combined 3D scene, correction sliders → POST /feedback
 ```
 
 ### Component Breakdown
 
 | Component | File | Responsibility |
 |---|---|---|
-| API Server | `backend/main.py` | HTTP routing, image I/O, orchestration |
-| Geometry Engine | `backend/geometry.py` | Maps 3D primitives → cross-section diameter profiles |
-| Crochet Grammar | `backend/grammar.py` | Converts diameter profiles → stitch instructions |
-| Frontend | `frontend/static/index.html` | Image upload UI, results display |
+| API server | `backend/main.py` | HTTP routing, orchestration, async job trackers, retrain trigger |
+| Vision providers | `backend/vision.py` | Gemini/Claude/Ollama abstraction, structured output, silent retry |
+| Geometry engine | `backend/geometry.py` | Scale-aware primitive → diameter profiles; optional learned model |
+| Crochet grammar | `backend/grammar.py` | Gauge-aware diameter profiles → stitch instructions |
+| 3D generation | `backend/comfyui.py` | ComfyUI lifecycle, Hunyuan3D image→.glb jobs, job tracker |
+| Mesh measurement | `backend/mesh_measure.py` | PCA alignment, vertical band slicing, per-part diameters |
+| Frontend | `frontend/static/index.html` | Upload UI, 3D previews, gauge settings, feedback sliders |
+| Data pipeline | `data/` | SQLite store, scrapers, pattern normalizer, dataset export |
+| Model training | `models/train.py` | Per-primitive GradientBoosting regressors + eval gate |
 
 ---
 
-## Pipeline (5 Stages)
+## Pipeline
 
 ### Stage 1 — Image Ingestion
-The FastAPI `/generate` endpoint accepts a multipart-uploaded image. The raw bytes are decoded into a PIL Image object for downstream use.
+`POST /generate` accepts a multipart image plus optional gauge fields (`gauge_stitches_per_10cm`, `gauge_rows_per_10cm`). The image is decoded via PIL and persisted to `backend/output/uploads/{session_id}.jpg` so the async 3D job can read it after the HTTP request completes.
 
-### Stage 2 — Semantic Analysis via Gemini Vision
-The image is sent to `gemini-1.5-flash` with a structured prompt asking it to decompose the doll into named anatomical parts, each tagged with:
-- **name** — e.g. `"Head"`, `"Body"`, `"Left Arm"`
-- **type** — one of `"sphere"`, `"cylinder"`, `"cone"`
-- **scale** — relative size multiplier (float)
+### Stage 2 — Vision Analysis
+`vision.analyze_with_retry()` sends the image to the provider selected by `VISION_PROVIDER` (default `gemini`, model from `GEMINI_MODEL`, default `gemini-2.0-flash`; alternatives: Claude via tool-forced JSON, Ollama via structured output). The call runs in a worker thread (`asyncio.to_thread`) so it never blocks the event loop.
 
-The model returns structured JSON conforming to the `DependencyGraph` schema (enforced via `response_mime_type="application/json"`).
+The prompt asks the model to decompose the doll into parts, each with:
+- **name** — e.g. `"Head"`, `"Left Arm"`
+- **type** — one of 8 primitives: `sphere`, `cylinder`, `cone`, `frustum`, `capsule`, `teardrop`, `flat_disc`, `torus`
+- **scale** — relative size multiplier (1.0 = medium)
+- **bbox** *(optional)* — normalized 2D bounding box `[x_min, y_min, x_max, y_max]` in image coordinates, used later by mesh measurement
 
-```
-Photo → Gemini → DependencyGraph
-{
-  "parts": [
-    {"name": "Head",  "type": "sphere",   "scale": 1.0},
-    {"name": "Body",  "type": "cylinder", "scale": 1.5},
-    {"name": "Arm",   "type": "cone",     "scale": 0.6}
-  ]
-}
-```
+Schema enforcement is native per provider (Gemini `response_schema`, Claude `input_schema`, Ollama `format`).
+
+Two robustness layers sit on top of the raw call:
+- **Silent retry** — if the response has < 4 parts or is missing a head/body, the call is retried (up to 2×) with a strengthened prompt demanding all visible parts. The last response is used regardless.
+- **Type coercion guards** — parts named arm/leg/paw/flipper classified as `sphere` are coerced to `capsule`; parts named ear/wing/fin are coerced to `flat_disc`. These correct the most common LLM misclassifications deterministically.
 
 ### Stage 3 — Geometry Engine: Primitive → Diameter Profile
-`GeometryEngine.process_dependency_graph()` iterates the part list and maps each primitive type to an ordered array of cross-section diameters (one per crochet round):
+`GeometryEngine.process_dependency_graph()` maps each part to an ordered array of cross-section diameters (one per crochet round). Profiles are **scale-aware** in two dimensions:
 
-| Primitive | Diameter Profile | Shape Rationale |
+1. **Amplitude** — every diameter is multiplied by `scale`.
+2. **Round count** — sphere, capsule, and teardrop extend their flat-plateau rounds proportionally to `√scale`, so a large body is taller as well as wider, not just inflated.
+
+| Primitive | Profile shape (scale = 1.0) | Typical use |
 |---|---|---|
-| `sphere` | `[2,4,6,8,8,8,6,4,2]` | Widens then narrows symmetrically |
-| `cylinder` | `[4,4,4,4,4,4]` | Constant cross-section |
-| `cone` | `[2,4,6,8,10]` | Monotonically widens from tip |
+| `sphere` | ramp 2→8, 3 flat rounds, taper 8→2 | Head, ball body |
+| `cylinder` | constant 4 × 6 rounds | Neck, straight limb |
+| `cone` | monotonic 2→10 | Beak, horn |
+| `frustum` | ramp 4→10, holds flat, no tail | Boxy torso, foot |
+| `capsule` | like sphere with a longer plateau | Plush limb, sausage body |
+| `teardrop` | ramp, short plateau, long asymmetric taper | Pear body, snout |
+| `flat_disc` | thin, reaches max width fast | Flat ear, hat brim |
+| `torus` | 4→8→4, non-zero minimum | Collar, ring |
 
-The `scale` field is threaded through but not yet applied to the diameter values — this is the primary extensibility hook for learned refinement (see [Future Learning](#future-learning)).
+Unknown primitive types fall back to `cylinder` with a logged warning; `scale <= 0` is rejected.
+
+**Learned-model path** — when `USE_LEARNED_MODEL=true`, `get_diameters_for_primitive()` first tries a per-primitive GradientBoosting regressor (`data/models/{type}_regressor.joblib`) fed a 7-feature vector (scale, round count, max count, mean rise, mean fall, flat fraction, symmetry). Any failure — missing model file, prediction error — logs a warning and falls back to the hardcoded profile.
 
 ### Stage 4 — Crochet Grammar: Diameters → Stitch Instructions
-`CrochetGrammar.compile_part()` performs two sub-steps:
+`CrochetGrammar` is **gauge-aware**: `stitch_width_cm` and `stitch_height_cm` are derived from user-supplied gauge (`10 / stitches_per_10cm`), defaulting to 1.0 when no gauge is given.
 
-#### 4a. Diameter → Stitch Count
-For each diameter `d`, the target stitch count per round is:
+**Round-based parts** (everything except `flat_disc`):
+
+For each diameter `d`, the target stitch count is
 
 ```
 count = max(6, 6 × round((d × π / w) / 6))
 ```
 
-Where `w` is `stitch_width` (default 1.0). This uses the circumference formula `C = π × d`, divides by stitch width to get raw stitch count, then snaps to the nearest multiple of 6 — a crochet convention that keeps increases and decreases evenly distributed.
+— circumference divided by stitch width, snapped to the nearest multiple of 6 so increases/decreases distribute evenly. `generate_round(prev, target)` then emits the correct directive:
 
-#### 4b. Stitch Count → Round Instruction
-`generate_round(prev_count, target_count)` computes the delta and emits the correct crochet directive:
+| Condition | Emitted instruction |
+|---|---|
+| first round | `6 sc in magic ring [6]` |
+| no change | `sc in each st around [n]` |
+| increase | `(sc k, inc) x m [n]` — evenly spaced |
+| increase > prev count | `j sc in each st around` (exact multiple) or capped doubling |
+| decrease | `(sc k, dec) x m [n]` — evenly spaced |
 
-| Condition | Emitted Instruction | Example |
-|---|---|---|
-| `prev_count == 0` | Start with magic ring | `6 sc in magic ring [6]` |
-| `delta == 0` | Single-crochet each stitch | `sc in each st around [24]` |
-| `delta > 0` | Evenly spaced increases | `(sc 3, inc) x 6 [30]` |
-| `delta < 0` | Evenly spaced decreases | `(sc 2, dec) x 6 [18]` |
+Each part ends with a **terminal closure**: tapered-closed parts get `Stuff firmly.` + fasten-off-and-weave; open-ended parts get `Stuff before sewing.` + long-tail fasten-off. Compilation stops early once a taper closes back to 6 stitches.
 
-The interval between increases/decreases is computed as `prev_count // |delta|` to spread them evenly around the round.
+**Flat parts** (`flat_disc`) compile to back-and-forth **rows** instead of rounds: `Ch n, turn` foundation, edge increases/decreases (`2 sc in first st`, `sc2tog`) to follow the width profile, ending with `Do NOT stuff. Sew flat.` Bare plural names (`Ears`, `Wings`, …) emit a singularized label plus `(make 2)`.
 
-### Stage 5 — Response
-A `List[PatternResponse]` is returned as JSON. Each object carries:
-- `name` — part label
-- `instructions` — ordered list of round strings (including a header separator)
+### Stage 5 — Response + Async Refinement
 
----
+The synchronous response is a `List[PatternResponse]`: `{name, instructions[], diameters[], primitive_type}` per part, where `diameters` is trimmed to the rounds actually emitted. The browser renders each part immediately as a rotatable Three.js `LatheGeometry` plus its instruction card.
 
-## Data Flow Summary
+If Node.js ≥ 22 is available, two background jobs are spawned per session:
 
-```
-Image
-  │
-  ▼ Gemini Vision
-[{name, type, scale}, …]          ← Semantic part graph
-  │
-  ▼ GeometryEngine
-[{name, diameters[]}, …]          ← Cross-section profiles
-  │
-  ▼ CrochetGrammar
-[{name, instructions[]}, …]       ← Stitch-level pattern text
-```
+**A. 3D preview** (`backend/comfyui.py`) — the uploaded photo is run through a Hunyuan3D ComfyUI workflow (via the image-blaster `image-to-3d.mjs` script) producing `backend/output/models/{session_id}.glb`. The frontend polls `GET /preview/{session_id}` and swaps the true mesh into the combined scene when done. The backend starts/stops a local ComfyUI instance on app startup/shutdown if one isn't already running.
+
+**B. Mesh measurement** (`backend/mesh_measure.py`) — once the .glb exists, each part's diameter profile is re-derived from actual mesh geometry:
+
+1. Load the mesh and PCA-align its dominant axis to +Y (no rescaling).
+2. Map each part's vision bbox to a vertical band on the mesh (Phase-1 assumption: photo and mesh share approximate upright orientation; no camera pose estimation).
+3. Slice the band at horizontal planes (~5 slices per mesh unit, min 4); each slice's max horizontal extent becomes one diameter.
+4. **Calibrate**: Hunyuan3D meshes have no absolute scale, so all measured values are multiplied by `hardcoded_max / measured_max`. This preserves the mesh's relative proportions while landing in the grammar's expected cm range — without it every part degenerates to a 6-stitch tube.
+5. Recompile each measured part through the grammar; parts that fail validation (or are `flat_disc`, which isn't sliceable this way) keep their profile-based pattern.
+
+The frontend polls `GET /measured/{session_id}` and swaps in the measured pattern when the job completes (typically ~40 s after generation). Both job trackers are in-memory dicts with a 1-hour TTL, evicted opportunistically on job creation.
 
 ---
 
-## Future Learning
+## Feedback & Learning Loop
 
-The current system uses **hardcoded diameter profiles** for each primitive type. The architecture isolates this in `GeometryEngine.get_diameters_for_primitive()`, making it the primary replacement target for a learned model.
+- **Correction UI** — each part's card has per-round diameter sliders; submitting posts original vs. corrected profiles to `POST /feedback`.
+- **Storage** — corrections land in SQLite (`data/aicrochet.db`) via `data/database.py`. If the DB layer is unavailable the endpoint returns 503 rather than failing silently.
+- **Retraining trigger** — after each submission, a background task checks the count of unincorporated corrections; at `RETRAIN_THRESHOLD` (default 100) it spawns `python -m models.train --all`. The spawn is lock-guarded with a process-liveness check so concurrent submissions can't start overlapping trainings.
+- **Training** (`models/train.py`) — per-primitive GradientBoosting regressors trained on the dataset (scraped + synthetic + feedback records). A model is only promoted to `data/models/{type}_regressor.joblib` if validation MAE < 1.0 stitches; failed evals are recorded, and the previous model is kept as `.bak`.
+- **Serving** — promoted models are used only when `USE_LEARNED_MODEL=true`; the hardcoded profiles remain the default and the fallback.
 
-### Planned Learning Paths
-
-#### Path 1 — Scale-Aware Profiles
-Apply `scale` to stretch or compress the diameter array non-uniformly (e.g., a scaled sphere should have more flat-top rounds, not just scaled-up diameters). A simple regression model trained on (scale, primitive_type) → diameter_profile pairs could replace the lookup table.
-
-#### Path 2 — Feedback-Driven Refinement
-Crafters who complete a pattern and find it inaccurate can submit corrections (e.g., "the head was too pointy — needed 2 more flat rounds"). These corrections map to diameter profile adjustments and can train a per-primitive profile predictor.
-
-#### Path 3 — Richer Vision Understanding
-Replace single-primitive-per-part classification with a model that predicts a full diameter profile directly from the cropped region of the doll image. This collapses Stages 2–3 into a single learned step:
+### Data Pipeline (feeds training)
 
 ```
-Cropped part image → CNN/ViT → diameter profile[]
+scraper (Ravelry API, WordPress pattern blogs)
+   │  (photo, raw pattern text) pairs + photo quality filter
+   ▼
+normalizer (US/UK terminology detection → instruction tokenizer
+   │         → stitch-count extraction → diameter reconstruction)
+   ▼
+dataset (SQLite; versioned, deduplicated, train/val split, synthetic seeding)
 ```
 
-#### Path 4 — Grammar Parameter Learning
-`stitch_width` and `stitch_height` in `CrochetGrammar` are currently fixed at 1.0. Real yarn gauges vary. A user-provided gauge swatch (stitches per cm) lets the grammar compute physically accurate round counts, and this measurement can be stored per-user.
+---
 
-### Extension Points in Current Code
+## HTTP Endpoints
 
-| Location | What to Replace | With |
+| Method | Path | Purpose |
 |---|---|---|
-| `geometry.py:3-9` | Hardcoded diameter lookup | Learned profile model |
-| `geometry.py:14` | `node.get('scale', 1.0)` ignored | Scale-conditioned profile generation |
-| `main.py:59` | `gemini-1.5-flash` fixed model | Fine-tunable vision model |
-| `grammar.py:4-5` | Fixed stitch dimensions | User gauge input |
+| POST | `/generate` | Photo (+ optional gauge, session_id) → per-part patterns; spawns async jobs |
+| GET | `/preview/{session_id}` | Poll 3D generation job → `{status, glb_url, error}` |
+| GET | `/measured/{session_id}` | Poll mesh-measurement job → `{status, parts, error}` |
+| POST | `/feedback` | Submit a diameter-profile correction (validates lengths match) |
+| GET | `/feedback/stats` | Correction counts and stats |
+| GET | `/` | Health check |
 
 ---
 
 ## Key Design Decisions
 
-**Neuro-symbolic pipeline** — Vision understanding (neural, via Gemini) is separated from pattern generation (symbolic, via Grammar). This keeps the generated patterns always valid crochet; errors in the vision step affect shape fidelity, not pattern correctness.
+**Neuro-symbolic pipeline** — vision understanding (neural) is separated from pattern generation (symbolic). Vision errors degrade shape fidelity, never pattern validity: every emitted pattern is arithmetically consistent crochet.
 
-**Multiples-of-6 quantization** — Crochet rounds increase/decrease most naturally in multiples of 6. Snapping stitch counts to this grid ensures evenly distributed increases with whole-number intervals.
+**Direct mesh measurement over refinement loops** — an earlier physics-based refinement loop and seamless-pattern exporter passed all internal tests but failed at the user boundary (quantization-bounded refinement, output rejected by external tools). Both were removed in the `direct-mesh-accuracy` change in favor of measuring the Hunyuan3D mesh directly — ground-truth geometry with one calibration step instead of iterative approximation.
 
-**Magic ring start** — Every part begins with a magic ring (`6 sc`), the standard amigurumi technique for closed-bottom 3D shapes.
+**Graceful degradation everywhere** — no Node/ComfyUI → patterns still generate, 3D preview is skipped; no vision bboxes → measurement is skipped; learned model failure → hardcoded profiles; no database → feedback endpoints return 503. The core photo→pattern path has no optional dependency.
 
-**Geometric primitives as vocabulary** — Constraining Gemini's output to three primitive types (sphere, cylinder, cone) limits ambiguity and makes the geometry→diameter mapping tractable with simple rules. More primitives (torus, frustum) can be added incrementally.
+**Multiples-of-6 quantization** — crochet rounds increase/decrease most naturally in multiples of 6; snapping to this grid guarantees whole-number increase spacing.
+
+**Magic ring start / flat-row split** — round parts start with the standard amigurumi magic ring; flat parts compile to turned rows with edge shaping, because treating them as degenerate cylinders produces unusable pieces.
+
+**Primitives as constrained vocabulary** — limiting the vision model to 8 named primitives (plus deterministic coercion guards for limbs and ears) keeps the geometry mapping tractable and the LLM's failure modes correctable.
