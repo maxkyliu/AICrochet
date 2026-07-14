@@ -1,0 +1,17 @@
+.git
+.venv
+.env
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.external_tools
+backend/output
+data/aicrochet.db
+data/raw
+data/models
+data/train.json
+data/val.json
+openspec
+Dockerfile
+.dockerignore

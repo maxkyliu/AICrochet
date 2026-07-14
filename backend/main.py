@@ -12,10 +12,13 @@ import PIL.Image
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, Request
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -40,9 +43,30 @@ except ImportError:
 
 RETRAIN_THRESHOLD = int(os.environ.get("RETRAIN_THRESHOLD", "100"))
 
+# ─── Public-deployment guards ─────────────────────────────────────────────────
+GENERATE_RATE_LIMIT = os.environ.get("GENERATE_RATE_LIMIT", "5/minute")
+FEEDBACK_RATE_LIMIT = os.environ.get("FEEDBACK_RATE_LIMIT", "20/minute")
+GENERATE_DAILY_LIMIT = int(os.environ.get("GENERATE_DAILY_LIMIT", "0"))  # 0 = unlimited
+MAX_UPLOAD_MB = float(os.environ.get("MAX_UPLOAD_MB", "8"))
+OUTPUT_TTL_HOURS = float(os.environ.get("OUTPUT_TTL_HOURS", "24"))
+
 logger = logging.getLogger(__name__)
 
+
+def _client_ip(request: Request) -> str:
+    """Rate-limit key. Behind a proxy (HF Spaces, Cloudflare) the direct peer is
+    the proxy, so prefer the first hop in X-Forwarded-For."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=_client_ip)
+
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 geo = GeometryEngine()
 
 _UPLOADS_DIR = os.path.join(PROJECT_ROOT, "backend", "output", "uploads")
@@ -67,6 +91,40 @@ async def _startup():
 @app.on_event("shutdown")
 async def _shutdown():
     comfyui.stop()
+
+
+# ─── Daily generation quota (caps vision-API spend on public deployments) ─────
+
+_daily_quota = {"day": None, "count": 0}
+_daily_quota_lock = threading.Lock()
+
+
+def _consume_daily_quota() -> bool:
+    """Count one generation against today's quota. Returns False if exhausted."""
+    if GENERATE_DAILY_LIMIT <= 0:
+        return True
+    with _daily_quota_lock:
+        today = time.strftime("%Y-%m-%d")
+        if _daily_quota["day"] != today:
+            _daily_quota["day"] = today
+            _daily_quota["count"] = 0
+        if _daily_quota["count"] >= GENERATE_DAILY_LIMIT:
+            return False
+        _daily_quota["count"] += 1
+        return True
+
+
+def _sweep_old_outputs() -> None:
+    """Delete uploads and generated meshes older than OUTPUT_TTL_HOURS so the
+    output dirs stay bounded on long-running public deployments."""
+    cutoff = time.time() - OUTPUT_TTL_HOURS * 3600
+    for directory in (_UPLOADS_DIR, _MODELS_DIR):
+        try:
+            for entry in os.scandir(directory):
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    os.unlink(entry.path)
+        except OSError as exc:
+            logger.warning("Output sweep failed for %s: %s", directory, exc)
 
 
 # ─── Mesh-measurement async job tracker ───────────────────────────────────────
@@ -277,7 +335,9 @@ async def measured_status(session_id: str):
 
 
 @app.post("/generate", response_model=List[PatternResponse])
+@limiter.limit(GENERATE_RATE_LIMIT)
 async def generate_pattern(
+    request: Request,
     file: UploadFile = File(...),
     gauge_stitches_per_10cm: Optional[float] = Form(None),
     gauge_rows_per_10cm: Optional[float] = Form(None),
@@ -286,16 +346,35 @@ async def generate_pattern(
     if not session_id:
         session_id = str(uuid.uuid4())
 
+    if not _consume_daily_quota():
+        raise HTTPException(
+            status_code=429,
+            detail="The demo's daily generation limit has been reached. Please try again tomorrow.",
+        )
+    _sweep_old_outputs()
+
+    image_data = await file.read()
+    if len(image_data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image too large — please upload a photo under {MAX_UPLOAD_MB:g} MB.",
+        )
+    try:
+        image = PIL.Image.open(io.BytesIO(image_data))
+        image.load()  # force full decode so truncated/corrupt files fail here
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a readable image. Please upload a JPEG or PNG photo.",
+        )
+
     sw = (10.0 / gauge_stitches_per_10cm) if gauge_stitches_per_10cm else 1.0
     sh = (10.0 / gauge_rows_per_10cm) if gauge_rows_per_10cm else 1.0
     grammar = CrochetGrammar(stitch_width_cm=sw, stitch_height_cm=sh)
 
     try:
-        image_data = await file.read()
-
         # Persist image for async 3D generation job
         upload_path = os.path.join(_UPLOADS_DIR, f"{session_id}.jpg")
-        image = PIL.Image.open(io.BytesIO(image_data))
         image.convert("RGB").save(upload_path, format="JPEG")
         img_io = io.BytesIO()
         image.convert("RGB").save(img_io, format="JPEG")
@@ -346,12 +425,21 @@ async def generate_pattern(
 
         return results
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Processing Error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception:
+        # Full traceback to the server log; generic message to the client so
+        # internals (API keys in exception text, file paths) never leak.
+        logger.exception("Pattern generation failed for session %s", session_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Pattern generation failed. Please retry, or try a clearer photo of the doll.",
+        )
 
 
 @app.post("/feedback", status_code=201)
-async def submit_feedback(feedback: FeedbackRequest, background_tasks: BackgroundTasks):
+@limiter.limit(FEEDBACK_RATE_LIMIT)
+async def submit_feedback(request: Request, feedback: FeedbackRequest, background_tasks: BackgroundTasks):
     if len(feedback.corrected_diameters) != len(feedback.original_diameters):
         raise HTTPException(
             status_code=422,
@@ -378,7 +466,14 @@ async def feedback_stats():
 
 @app.get("/")
 async def root():
-    return {"message": "AICrochet API is running. Access /static/index.html"}
+    # Serve the UI at the root — public deployments (e.g. HF Spaces iframe)
+    # load this URL directly.
+    return RedirectResponse(url="/static/index.html")
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

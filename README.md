@@ -1,3 +1,13 @@
+---
+title: AICrochet
+emoji: 🧶
+colorFrom: pink
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # AICrochet
 
 Upload a photo of a doll and get row-by-row crochet instructions to build it by hand. The system uses a vision LLM (Gemini by default; Claude and Ollama supported) to decompose the doll into 3D geometric parts, a geometry engine to compute cross-section diameter profiles, and a rule-based grammar to emit mathematically valid stitch instructions. A 3D preview renders in the browser; when the optional Hunyuan3D pipeline is available, the pattern is refined with diameters measured from an actual 3D mesh of the photo. Crafter feedback feeds back into a learned geometry model that improves over time.
@@ -81,6 +91,11 @@ All variables and their defaults:
 | `RETRAIN_THRESHOLD` | No | `100` | Crafter corrections before auto-retraining |
 | `HOST` | No | `0.0.0.0` | Server bind address |
 | `PORT` | No | `8000` | Server port |
+| `GENERATE_RATE_LIMIT` | No | `5/minute` | Per-IP rate limit on `/generate` |
+| `FEEDBACK_RATE_LIMIT` | No | `20/minute` | Per-IP rate limit on `/feedback` |
+| `GENERATE_DAILY_LIMIT` | No | `0` (unlimited) | Global daily cap on generations (vision-API spend guard) |
+| `MAX_UPLOAD_MB` | No | `8` | Maximum accepted photo size |
+| `OUTPUT_TTL_HOURS` | No | `24` | Uploads/meshes older than this are deleted |
 
 > `.env` is listed in `.gitignore` and will never be committed.
 
@@ -156,8 +171,8 @@ for p in parts:
 ### API tests (server must be running)
 
 ```bash
-# Health check
-curl http://localhost:8000/
+# Health check (/ redirects to the UI)
+curl http://localhost:8000/healthz
 
 # Generate pattern from image
 curl -X POST http://localhost:8000/generate \
@@ -179,6 +194,29 @@ curl -X POST http://localhost:8000/feedback \
 # Check feedback stats
 curl http://localhost:8000/feedback/stats
 ```
+
+---
+
+## Deploying a Public Demo (Hugging Face Spaces)
+
+The repo ships a `Dockerfile` and the HF Spaces frontmatter at the top of this README, so the whole repo *is* the Space. The demo runs the CPU-only pattern path — 3D mesh generation and mesh measurement are skipped gracefully (no GPU/Node on the free tier); crafters still get patterns and rotatable profile previews.
+
+1. Create a Space at [huggingface.co/new-space](https://huggingface.co/new-space) — SDK: **Docker**, hardware: **CPU basic (free)**.
+2. In the Space's **Settings → Variables and secrets**, add:
+   - Secret `GOOGLE_API_KEY` — your Gemini key (never commit it)
+   - Variable `GENERATE_DAILY_LIMIT` — e.g. `200`, caps daily vision-API spend
+3. Push this repo to the Space:
+
+   ```bash
+   git remote add space https://huggingface.co/spaces/<user>/aicrochet
+   git push space main
+   ```
+
+The Space builds the Dockerfile and serves the UI at its public URL.
+
+**Abuse guards baked in:** per-IP rate limits on `/generate` and `/feedback`, a global daily generation cap, an upload size cap (413), image validation (400), generic error messages (internals only go to server logs), and 24 h TTL cleanup of uploaded photos.
+
+**Known tradeoff:** Space storage is ephemeral — the SQLite feedback DB resets on rebuild/restart. Fine for a demo; attach persistent storage (or point `AICROCHET_DB` at a mounted volume) if crafter corrections start mattering.
 
 ---
 
