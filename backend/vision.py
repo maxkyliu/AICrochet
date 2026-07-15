@@ -153,8 +153,10 @@ def _analyze_agnes(img_bytes: bytes, prompt: str) -> dict:
 
     base_url = os.environ.get("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
     api_key = os.environ.get("AGNES_API_KEY")
-    if not api_key:
-        raise RuntimeError("AGNES_API_KEY is not set")
+    if not api_key or api_key.startswith("your-"):
+        raise RuntimeError(
+            "AGNES_API_KEY is not set (found placeholder or empty value in .env)"
+        )
     model = os.environ.get("AGNES_MODEL", "agnes-2.0-flash")
     img_b64 = base64.standard_b64encode(img_bytes).decode()
 
