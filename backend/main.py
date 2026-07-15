@@ -155,52 +155,96 @@ def _measure_get(session_id: str):
     return _measure_jobs.get(session_id)
 
 
+def _original_part(p: dict) -> dict:
+    return {
+        "name": p["name"],
+        "instructions": p["instructions"],
+        "diameters": list(p["diameters"]),
+        "primitive_type": p.get("primitive_type") or "sphere",
+    }
+
+
 def _measure_sync(parts_in: list, glb_path: str, grammar) -> list:
     """Blocking measurement work — runs off the event loop via to_thread.
 
-    Two-pass: measure raw diameters per part first, then calibrate them
-    against the hardcoded diameters' max so they land in the grammar's
-    expected cm-like range while preserving relative proportions from the mesh.
-    Hunyuan3D meshes have no absolute scale, so the calibration is essential —
-    without it every measured part becomes a degenerate 6-stitch tube.
+    The mesh contributes what it is good at — per-part relative size and
+    coarse shape — while the primitive's reference curve (market prototype,
+    or hardcoded profile) constrains the result to a crochetable profile.
+    Any part whose measurement fails sanity checks or the quality gate keeps
+    its initial-estimate version; a session with unreliable orientation is
+    returned unmeasured so the swap can never degrade the pattern.
     """
     mesh = mesh_measure.load_normalized_mesh(glb_path)
 
-    # Pass 1: measure each measurable part's raw mesh diameters.
+    # Bboxes arrive in photo-frame coords but the mesh spans exactly the
+    # subject — rescale so the bbox union covers 0..1 before any mapping.
+    norm_bboxes = mesh_measure.normalize_bboxes([p.get("bbox") for p in parts_in])
+    parts_in = [
+        {**p, "bbox": nb} for p, nb in zip(parts_in, norm_bboxes)
+    ]
+
+    # Orientation: PCA sign is arbitrary — verify against the photo's bbox
+    # layout, and keep the initial parts when there is no usable signal.
+    bboxes = [b for b in norm_bboxes if b]
+    mesh, confidence = mesh_measure.resolve_orientation(mesh, bboxes)
+    if confidence < mesh_measure.MIN_ORIENTATION_CONFIDENCE:
+        logger.info(
+            "Mesh orientation confidence %.2f below threshold; keeping initial parts",
+            confidence,
+        )
+        return [_original_part(p) for p in parts_in]
+
+    # Pass 1: measure each measurable part's raw mesh diameters. Slice at the
+    # initial profile's round count so resolution matches the expected length.
     raw = []  # list of (part_in_dict, measured_or_None)
     for p in parts_in:
         bbox = p.get("bbox")
         ptype = p.get("primitive_type") or "sphere"
+        expected_n = len(p.get("diameters") or [])
         if not bbox or ptype == "flat_disc":
             raw.append((p, None))
             continue
-        measured = mesh_measure.measure_part(mesh, bbox)
-        if not mesh_measure._is_reasonable(measured, len(measured)):
+        n_slices = max(expected_n, mesh_measure.MIN_SLICES) if expected_n else None
+        measured = mesh_measure.measure_part(mesh, bbox, n_slices=n_slices)
+        if not mesh_measure._is_reasonable(measured, expected_n):
             raw.append((p, None))
             continue
         raw.append((p, measured))
 
-    # Calibration: align the measured max to the hardcoded max.
-    measured_max = max((max(m) for _, m in raw if m), default=0.0)
-    hardcoded_max = max((max(p["diameters"]) for p, _ in raw if p.get("diameters")), default=0.0)
-    scale = (hardcoded_max / measured_max) if (measured_max > 0 and hardcoded_max > 0) else 1.0
+    # Calibration: Hunyuan3D meshes have no absolute scale. Use the median of
+    # per-part initial_max/measured_max ratios so one inflated measurement
+    # cannot shrink every other part.
+    ratios = sorted(
+        max(p["diameters"]) / max(m)
+        for p, m in raw
+        if m and p.get("diameters") and max(m) > 0
+    )
+    scale = ratios[len(ratios) // 2] if ratios else 1.0
 
-    # Pass 2: recompile through grammar with calibrated diameters.
+    alpha = float(os.environ.get("MESH_BLEND_ALPHA", "0.5"))
+
+    # Pass 2: regularize against the reference shape, gate, and recompile.
     refined = []
     for p, measured in raw:
         ptype = p.get("primitive_type") or "sphere"
         if measured is None:
-            refined.append({
-                "name": p["name"],
-                "instructions": p["instructions"],
-                "diameters": list(p["diameters"]),
-                "primitive_type": ptype,
-            })
+            refined.append(_original_part(p))
             continue
         calibrated = [d * scale for d in measured]
-        instrs = grammar.compile_part(p["name"], calibrated, primitive_type=ptype)
+        ref_curve, rounds_per_max = geo.get_reference_curve(ptype)
+        profile, mae = mesh_measure.regularize_profile(
+            calibrated, ref_curve, rounds_per_max, grammar.w, alpha
+        )
+        if not profile or mae > mesh_measure.MAX_GATE_MAE:
+            logger.info(
+                "Part '%s' failed measurement gate (mae=%.3f); keeping initial part",
+                p["name"], mae,
+            )
+            refined.append(_original_part(p))
+            continue
+        instrs = grammar.compile_part(p["name"], profile, primitive_type=ptype)
         rounds_used = sum(1 for line in instrs if line.startswith(("Rnd ", "Row ")))
-        eff = calibrated[:rounds_used] if rounds_used else calibrated
+        eff = profile[:rounds_used] if rounds_used else profile
         refined.append({
             "name": p["name"],
             "instructions": instrs,

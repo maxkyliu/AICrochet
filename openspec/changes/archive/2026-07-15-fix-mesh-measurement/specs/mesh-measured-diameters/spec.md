@@ -1,9 +1,6 @@
-# mesh-measured-diameters Specification
+# mesh-measured-diameters — Delta Specification
 
-## Purpose
-Derive per-part diameter profiles from the session's Hunyuan3D `.glb` by vertical band slicing — replacing the hardcoded `GeometryEngine` profile path when the LLM supplies per-part bounding boxes — and surface the resulting pattern via an async polling endpoint so `/generate` stays fast.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Derive per-part diameters from the session mesh by vertical band slicing
 The backend SHALL provide a function `measure_part(mesh, bbox, n_slices=None)` that, given a normalized mesh and a part's 2D bounding box in image coordinates `[x_min, y_min, x_max, y_max]` (normalized 0..1), returns a list of float diameter values: it maps the bbox's `y_min`/`y_max` onto the mesh's vertical extent, takes N equally-spaced horizontal cross-sections within that band, and at each slice measures the diameter from the cross-section's horizontal extent (bounding-box diameter, not fitted circle). Each cross-section SHALL be restricted to vertices whose x-coordinate falls inside the part's bbox `x_min`/`x_max` mapped onto the mesh's x-extent, expanded by a small tolerance margin (~5% of the mesh's x-extent); vertices outside the window SHALL NOT contribute to the diameter. The z-extent remains unconstrained. The function SHALL skip slices with no intersection or with fewer than 2 in-window vertices, and SHALL never raise on degenerate input — it returns an empty list instead.
@@ -39,38 +36,24 @@ The backend SHALL provide `load_normalized_mesh(glb_path)` that loads the GLB vi
 - **WHEN** the PCA alignment leaves the mesh inverted relative to the photo's part layout (e.g. widest part at the top while the bboxes place it at the bottom)
 - **THEN** the mesh is flipped about y before measurement so bands map to the intended parts
 
-### Requirement: Slice count scales with part band height
-The default `n_slices` SHALL be `max(4, round(band_height * SLICE_DENSITY))` where `band_height` is the part's vertical extent in mesh units and `SLICE_DENSITY` is a tunable constant calibrated so a full-doll-height part receives ~10 slices.
+### Requirement: Per-part measurement failure falls back to the hardcoded part
+The backend SHALL recompile each part's instructions from the regularized measured profile via `CrochetGrammar.compile_part`, passing through the existing `primitive_type`. A part's measurement SHALL be rejected — retaining the initial-estimate part — when any of the following hold: the measured array is empty; any value is zero or negative; the measured length differs from the part's initial profile round count by more than ±50%; or the regularized profile fails the swap quality gate. A direction-flip fraction above 30% does NOT reject the part; it forces the shape-blend weight α to 0 (see regularization requirement) so the measurement contributes amplitude only. The sanity check's expected length SHALL come from the initial profile's round count for that part, not from the measured array itself.
 
-#### Scenario: Tall part gets more slices than short part
-- **WHEN** two parts on the same mesh have different bbox y-ranges
-- **THEN** the part with the larger y-range receives a larger `n_slices` (with the floor of 4)
+#### Scenario: Failed measurement keeps the original part
+- **WHEN** `measure_part` returns an empty list for a given part
+- **THEN** the response's `parts` entry for that part is the original initial-estimate version, not omitted
 
-### Requirement: Measured pattern is delivered via async polling endpoint
-The backend SHALL expose `GET /measured/{session_id}` returning `{status, parts, error}` where `status` is `pending`|`running`|`done`|`failed` and `parts` (when `done`) has the same shape as the `/generate` response (each part has `name`, `instructions`, `diameters`, `primitive_type`). Unknown session IDs SHALL return HTTP 404.
+#### Scenario: Length drift is caught against the initial profile
+- **WHEN** a part's initial profile has 12 rounds and the measurement yields 4 values
+- **THEN** the measurement is rejected and the initial-estimate part is retained
 
-#### Scenario: Status while running
-- **WHEN** `GET /measured/{session_id}` is called during measurement
-- **THEN** the response status is `running` and `parts` is null
+## REMOVED Requirements
 
-#### Scenario: Measured parts returned when done
-- **WHEN** measurement completes successfully
-- **THEN** the response status is `done` and `parts` contains the per-part instructions recompiled from the measured diameters
+### Requirement: Measured diameters are calibrated against the hardcoded max
+**Reason**: The single global factor `hardcoded_max / measured_max` divides by the most-inflated measurement, propagating one contaminated part's error to every part in the session.
+**Migration**: Replaced by "Measured diameters are calibrated by the median per-part ratio against the initial estimate" below; no API or data migration required.
 
-#### Scenario: Unknown session
-- **WHEN** the endpoint is called with a session id with no measurement job
-- **THEN** the response is HTTP 404
-
-### Requirement: Measurement runs only after the session mesh is ready
-The backend SHALL schedule the measurement background job after the session's Hunyuan3D `.glb` reaches `done`. The job SHALL NOT block `/generate`. If the LLM response contained no bounding boxes for any part, the measurement job SHALL NOT be scheduled.
-
-#### Scenario: Scheduled after mesh ready
-- **WHEN** the session's 3D job reaches `done` and at least one part has a bbox
-- **THEN** a measurement job for that session is created with status `pending`/`running`
-
-#### Scenario: Skipped when no bboxes
-- **WHEN** the LLM response contained no `bbox` field on any part
-- **THEN** no measurement job is created and `GET /measured/{session_id}` returns 404
+## ADDED Requirements
 
 ### Requirement: Measured diameters are calibrated by the median per-part ratio against the initial estimate
 Hunyuan3D meshes have no absolute scale. The measurement coordinator SHALL collect raw measurements for all measurable parts first, compute each part's ratio `initial_profile_max / measured_max`, and apply the median of those ratios as a single session scale factor to every measured array before regularization and recompilation. This preserves the mesh's relative proportions between parts while remaining robust to a single inflated measurement.
@@ -107,25 +90,3 @@ Before a measurement job stores `done` parts, the coordinator SHALL score each m
 #### Scenario: Low orientation confidence skips the whole swap
 - **WHEN** the orientation check's correlation is below the confidence threshold in both orientations
 - **THEN** the measurement job completes with the original parts and no measured recompilation is attempted
-
-### Requirement: Per-part measurement failure falls back to the hardcoded part
-The backend SHALL recompile each part's instructions from the regularized measured profile via `CrochetGrammar.compile_part`, passing through the existing `primitive_type`. A part's measurement SHALL be rejected — retaining the initial-estimate part — when any of the following hold: the measured array is empty; any value is zero or negative; the measured length differs from the part's initial profile round count by more than ±50%; or the regularized profile fails the swap quality gate. A direction-flip fraction above 30% does NOT reject the part; it forces the shape-blend weight α to 0 (see regularization requirement) so the measurement contributes amplitude only. The sanity check's expected length SHALL come from the initial profile's round count for that part, not from the measured array itself.
-
-#### Scenario: Failed measurement keeps the original part
-- **WHEN** `measure_part` returns an empty list for a given part
-- **THEN** the response's `parts` entry for that part is the original initial-estimate version, not omitted
-
-#### Scenario: Length drift is caught against the initial profile
-- **WHEN** a part's initial profile has 12 rounds and the measurement yields 4 values
-- **THEN** the measurement is rejected and the initial-estimate part is retained
-
-### Requirement: Frontend swaps in the measured pattern when ready
-The frontend SHALL poll `GET /measured/{session_id}` after a standard pattern is generated, display a measurement status badge during polling, and on `done` swap the per-part cards + previews using the existing `renderParts` mechanism. On `failed` or timeout, the original pattern remains and the badge is hidden.
-
-#### Scenario: Pattern swapped on completion
-- **WHEN** measurement polling returns `done` with parts
-- **THEN** the per-part cards update to the measured diameters and the badge is hidden
-
-#### Scenario: Original kept on failure
-- **WHEN** polling returns `failed` or 150 ticks elapse without `done`
-- **THEN** the displayed pattern remains unchanged and the badge is hidden
