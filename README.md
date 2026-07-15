@@ -88,6 +88,7 @@ All variables and their defaults:
 | `RAVELRY_USERNAME` | Phase 2 only | — | Ravelry account username |
 | `RAVELRY_API_KEY` | Phase 2 only | — | Ravelry personal API key |
 | `AICROCHET_DB` | No | `data/aicrochet.db` | Path to SQLite database |
+| `USE_MARKET_PROFILES` | No | `true` | Use market-learned prototype profiles (`data/models/market_profiles.json`) |
 | `USE_LEARNED_MODEL` | No | `false` | Use trained regressor instead of hardcoded profiles |
 | `RETRAIN_THRESHOLD` | No | `100` | Crafter corrections before auto-retraining |
 | `HOST` | No | `0.0.0.0` | Server bind address |
@@ -281,6 +282,21 @@ Requires data in the database (run the pipeline steps above first).
 ```
 
 Models are saved to `data/models/` and only promoted if validation MAE < 1.0 stitches. Enable the learned model by setting `USE_LEARNED_MODEL=true` in `.env`.
+
+### Market prototype profiles (default initial-profile source)
+
+Per-primitive canonical stitch-count curves learned from real scraped patterns. Rebuild after re-ingesting data:
+
+```bash
+# Re-extract training records from data/raw with the normalizer
+.venv/bin/python -m data.normalizer run --source all
+
+# Build prototype curves and compare against hardcoded profiles (leave-one-out MAE)
+.venv/bin/python -m models.prototypes build
+.venv/bin/python -m models.prototypes eval
+```
+
+Prototypes are written to `data/models/market_profiles.json` and used by `GeometryEngine` when `USE_MARKET_PROFILES=true` (the default). Primitives without enough market samples fall back to hardcoded profiles automatically.
 
 ---
 

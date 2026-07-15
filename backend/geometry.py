@@ -1,8 +1,20 @@
+import json
 import math
 import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+
+def _interp(x: float, xs: list, ys: list) -> float:
+    """Piecewise-linear interpolation over sorted xs (both ends clamped)."""
+    if x <= xs[0]:
+        return ys[0]
+    for i in range(1, len(xs)):
+        if x <= xs[i]:
+            t = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+            return ys[i - 1] + t * (ys[i] - ys[i - 1])
+    return ys[-1]
 
 _SUPPORTED = frozenset([
     "sphere", "cylinder", "cone", "frustum", "capsule", "teardrop", "flat_disc", "torus"
@@ -40,10 +52,68 @@ def _build_profile(shape_type: str, scale: float) -> list:
     return [d * scale for d in raw]
 
 
+# Reference amplitude: a scale-1.0 part peaks at 24 stitches (the same
+# reference data/normalizer/labeler.py uses to infer scale from patterns).
+_SCALE_REFERENCE_STITCHES = 24.0
+_MIN_PROFILE_ROUNDS = 4
+_MAX_PROFILE_ROUNDS = 48
+
+
 class GeometryEngine:
     _model_cache: dict = {}
+    _market_profiles: dict = None
+
+    def _load_market_profiles(self) -> dict:
+        if GeometryEngine._market_profiles is None:
+            path = os.path.join(
+                os.path.dirname(__file__), "..", "data", "models", "market_profiles.json"
+            )
+            try:
+                with open(path) as f:
+                    GeometryEngine._market_profiles = json.load(f).get("profiles", {})
+            except (OSError, ValueError):
+                GeometryEngine._market_profiles = {}
+        return GeometryEngine._market_profiles
+
+    def _market_profile(self, shape_type: str, scale: float):
+        """Sample the market-learned prototype curve for this primitive.
+
+        Returns a diameter profile list, or None if no prototype exists.
+        """
+        proto = self._load_market_profiles().get(shape_type)
+        if not proto:
+            return None
+        curve = proto["curve"]
+        max_count = _SCALE_REFERENCE_STITCHES * scale
+        n = round(proto["rounds_per_max"] * max_count)
+        n = max(_MIN_PROFILE_ROUNDS, min(_MAX_PROFILE_ROUNDS, n))
+        # Resample the unit curve at n rounds, then convert counts → diameters.
+        grid = [i / (n - 1) for i in range(n)]
+        u = [i / (len(curve) - 1) for i in range(len(curve))]
+        counts = [_interp(g, u, curve) * max_count for g in grid]
+        return [c / math.pi for c in counts]
+
+    def get_reference_curve(self, shape_type: str) -> tuple:
+        """Unit-amplitude reference profile for a primitive: the market
+        prototype when available, else the normalized hardcoded profile.
+
+        Returns (curve, rounds_per_max) where curve is a list of floats with
+        max 1.0 and rounds_per_max converts a max stitch count to a round
+        count (n_rounds ≈ rounds_per_max × max_stitches).
+        """
+        proto = self._load_market_profiles().get(shape_type)
+        if proto:
+            return list(proto["curve"]), float(proto["rounds_per_max"])
+        base = _build_profile(shape_type if shape_type in _SUPPORTED else "cylinder", 1.0)
+        counts = [d * math.pi for d in base]
+        max_count = max(counts)
+        return [c / max_count for c in counts], len(counts) / max_count
 
     def get_diameters_for_primitive(self, shape_type: str, scale: float = 1.0) -> list:
+        if os.environ.get("USE_MARKET_PROFILES", "true").lower() == "true":
+            profile = self._market_profile(shape_type, scale)
+            if profile is not None:
+                return profile
         if os.environ.get("USE_LEARNED_MODEL", "false").lower() == "true":
             profile = self._predict_from_model(shape_type, scale)
             if profile is not None:

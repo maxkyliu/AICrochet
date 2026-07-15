@@ -11,6 +11,12 @@ geo = GeometryEngine()
 ALL_PRIMITIVES = ["sphere", "cylinder", "cone", "frustum", "capsule", "teardrop", "flat_disc", "torus"]
 
 
+@pytest.fixture(autouse=True)
+def _hardcoded_profiles(monkeypatch):
+    """These tests assert the hardcoded-profile contract; pin the engine to it."""
+    monkeypatch.setenv("USE_MARKET_PROFILES", "false")
+
+
 # --- Amplitude scaling ---
 
 class TestAmplitudeScaling:
