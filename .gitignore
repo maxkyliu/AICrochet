@@ -16,6 +16,8 @@ data/raw/
 data/models/*.joblib
 data/models/*.joblib.bak
 data/models/*.json
+# Market prototype curves ship with the code (rebuild: python -m models.prototypes build)
+!data/models/market_profiles.json
 
 # Pytest
 .pytest_cache/
